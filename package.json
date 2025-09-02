@@ -1,0 +1,19 @@
+{
+  "name": "notif-bot",
+  "version": "1.0.0",
+  "description": "Supabase realtime to Telegram notification bot",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "nodemon bot.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.7",
+    "node-telegram-bot-api": "^0.61.0",
+    "dotenv": "^16.4.5",
+    "aws-sdk": "^2.1691.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.3"
+  }
+}
