@@ -1,4 +1,4 @@
-require('dotenv').config();
+ require('dotenv').config();
 const { createClient } = require('@supabase/supabase-js');
 const TelegramBot = require('node-telegram-bot-api');
 const AWS = require('aws-sdk');
@@ -35,6 +35,59 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
 });
 const bot = new TelegramBot(TELEGRAM_TOKEN, { polling: false });
 
+// Deduplication system
+const processedEvents = new Map();
+const EVENT_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+const milestoneCache = new Map(); // Cache for milestone tracking
+
+// Clean up old events periodically
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, timestamp] of processedEvents.entries()) {
+    if (now - timestamp > EVENT_CACHE_TTL) {
+      processedEvents.delete(key);
+    }
+  }
+  
+  // Clean milestone cache (keep for 1 hour)
+  for (const [key, timestamp] of milestoneCache.entries()) {
+    if (now - timestamp > 60 * 60 * 1000) {
+      milestoneCache.delete(key);
+    }
+  }
+}, 60000); // Clean every minute
+
+function generateEventId(table, event, payload) {
+  // Create unique ID based on table, event type, primary key, and key field values
+  const pk = payload.new?.id || payload.old?.id;
+  const timestamp = payload.new?.updated_at || payload.new?.created_at || Date.now();
+  
+  // Include relevant field values in hash for UPDATE events
+  let fieldHash = '';
+  if (event === 'UPDATE' && payload.new) {
+    const relevantFields = {
+      Users: ['amount_deposited', 'total_pnl', 'total_volume', 'txns_executed', 'is_copytrading_enabled', 'fees_total'],
+      Auto_Trade: ['status'],
+      Copy_Wallets: ['is_enabled', 'percent_ratio']
+    };
+    
+    if (relevantFields[table]) {
+      const values = relevantFields[table].map(field => payload.new[field]).join('|');
+      fieldHash = Buffer.from(values).toString('base64').slice(0, 10);
+    }
+  }
+  
+  return `${table}:${event}:${pk}:${timestamp}:${fieldHash}`;
+}
+
+function isDuplicateEvent(eventId) {
+  if (processedEvents.has(eventId)) {
+    return true;
+  }
+  processedEvents.set(eventId, Date.now());
+  return false;
+}
+
 function sendTelegramMessage(text) {
   return bot.sendMessage(CHAT_ID, text, { parse_mode: 'HTML', disable_web_page_preview: true })
     .catch(err => {
@@ -56,16 +109,30 @@ function fmt(n) {
   return String(n);
 }
 
+// Enhanced milestone tracking with deduplication
+function checkAndNotifyMilestone(userId, milestoneType, oldValue, newValue, milestones, messageGenerator) {
+  const cacheKey = `${userId}:${milestoneType}`;
+  const lastNotified = milestoneCache.get(cacheKey) || 0;
+  
+  for (const milestone of milestones) {
+    if (oldValue < milestone && newValue >= milestone && milestone > lastNotified) {
+      milestoneCache.set(cacheKey, milestone);
+      return messageGenerator(milestone, newValue);
+    }
+  }
+  return null;
+}
+
 console.log('Connecting to Supabase...');
 console.log('Connecting to AWS SQS...');
 
-// SQS polling function
+// SQS polling function (unchanged)
 async function pollSQSMessages() {
   const params = {
     QueueUrl: SQS_QUEUE_URL,
     MaxNumberOfMessages: 10,
-    WaitTimeSeconds: 20, // Long polling
-    VisibilityTimeout: 30       // <-- correct key
+    WaitTimeSeconds: 20,
+    VisibilityTimeout: 30
   };
 
   try {
@@ -79,7 +146,6 @@ async function pollSQSMessages() {
           const orderData = JSON.parse(message.Body);
           await processSQSOrder(orderData);
           
-          // Delete message after successful processing
           await sqs.deleteMessage({
             QueueUrl: SQS_QUEUE_URL,
             ReceiptHandle: message.ReceiptHandle
@@ -89,7 +155,6 @@ async function pollSQSMessages() {
           console.error('Error parsing SQS message:', parseError);
           console.log('Raw message body:', message.Body);
           
-          // Delete malformed messages to prevent infinite reprocessing
           await sqs.deleteMessage({
             QueueUrl: SQS_QUEUE_URL,
             ReceiptHandle: message.ReceiptHandle
@@ -101,38 +166,21 @@ async function pollSQSMessages() {
     console.error('Error polling SQS:', error);
   }
   
-  // Continue polling
   setTimeout(pollSQSMessages, 1000);
 }
 
-// Process SQS order message
+// Process SQS order message (unchanged)
 async function processSQSOrder(orderData) {
   const {
-    userId,
-    username,
-    orderId,
-    orderType,
-    side,
-    marketId,
-    marketQuestion,
-    amount,
-    shares,
-    executionPrice,
-    txHash,
-    timestamp,
-    status,
-    outcome
+    userId, username, orderId, orderType, side, marketId, marketQuestion,
+    amount, shares, executionPrice, txHash, timestamp, status, outcome
   } = orderData;
 
   console.log('Processing SQS order:', orderData);
 
   const statusEmoji = {
-    'matched': '✅',
-    'filled': '✅',
-    'partial': '⚠️',
-    'cancelled': '❌',
-    'failed': '❌',
-    'pending': '⏳'
+    'matched': '✅', 'filled': '✅', 'partial': '⚠️',
+    'cancelled': '❌', 'failed': '❌', 'pending': '⏳'
   };
 
   const sideEmoji = side === 'YES' ? '🟢' : '🔴';
@@ -155,59 +203,77 @@ async function processSQSOrder(orderData) {
 pollSQSMessages();
 
 (async () => {
-  // Users INSERT
-  const usersInsert = supabase.channel('users-insert')
+  // Single consolidated channel for all database events
+  const dbChannel = supabase.channel('db-events')
+    // Users INSERT
     .on('postgres_changes', {
       event: 'INSERT',
       schema: 'public',
       table: 'Users'
     }, async (payload) => {
-        const user = payload.new;
-        const msg = `👤 <b>New user registered</b>\n` +
-          `ID: <code>${user.id}</code>\n` +
-          `Telegram: @${escapeHtml(user.telegram_username)}\n` +
-          `Wallet: <code>${escapeHtml(user.wallet_address)}</code>\n` +
-          `Deposited: <b>${fmt(user.amount_deposited)}</b>\n` +
-          `Copytrading: <b>${user.is_copytrading_enabled ? 'Enabled' : 'Disabled'}</b>\n` +
-          `Referral code: <code>${escapeHtml(user.referral_code || 'None')}</code>\n` +
-          `Created: <code>${user.created_at}</code>`;
-        console.log('Users INSERT:', user);
-        await sendTelegramMessage(msg);
-    })
-    .subscribe((status) => {
-      if (status === 'SUBSCRIBED') console.log('Subscribed to Users INSERT');
-    });
+      const eventId = generateEventId('Users', 'INSERT', payload);
+      if (isDuplicateEvent(eventId)) {
+        console.log('Skipping duplicate Users INSERT event');
+        return;
+      }
 
-  // Users UPDATE - Multiple important changes
-  const usersUpdate = supabase.channel('users-update')
+      const user = payload.new;
+      const msg = `👤 <b>New user registered</b>\n` +
+        `ID: <code>${user.id}</code>\n` +
+        `Telegram: @${escapeHtml(user.telegram_username)}\n` +
+        `Wallet: <code>${escapeHtml(user.wallet_address)}</code>\n` +
+        `Deposited: <b>${fmt(user.amount_deposited)}</b>\n` +
+        `Copytrading: <b>${user.is_copytrading_enabled ? 'Enabled' : 'Disabled'}</b>\n` +
+        `Referral code: <code>${escapeHtml(user.referral_code || 'None')}</code>\n` +
+        `Created: <code>${user.created_at}</code>`;
+      console.log('Users INSERT:', user);
+      await sendTelegramMessage(msg);
+    })
+    
+    // Users UPDATE with improved logic
     .on('postgres_changes', {
       event: 'UPDATE',
       schema: 'public',
       table: 'Users'
     }, async (payload) => {
+      const eventId = generateEventId('Users', 'UPDATE', payload);
+      if (isDuplicateEvent(eventId)) {
+        console.log('Skipping duplicate Users UPDATE event');
+        return;
+      }
+
       const userNew = payload.new;
       const userOld = payload.old || {};
       const id = userNew.id;
       const username = userNew.telegram_username;
       
-      // Deposit detection (amount_deposited increases)
-      const newAmt = Number(userNew.amount_deposited || 0);
-      const oldAmt = Number(userOld.amount_deposited ?? 0);
-      if (!isNaN(newAmt) && newAmt > oldAmt) {
-        const depositAmount = newAmt - oldAmt;
-        const msg = `💰 <b>Deposit detected</b>\n` +
-          `User: @${escapeHtml(username)} (<code>${fmt(id)}</code>)\n` +
-          `Amount: <b>+${fmt(depositAmount)}</b>\n` +
-          `New total: <b>${fmt(newAmt)}</b>`;
-        console.log('Users UPDATE (deposit):', { before: oldAmt, after: newAmt, deposit: depositAmount });
-        await sendTelegramMessage(msg);
+      // Only process if we have meaningful old values
+      const hasRelevantOldData = userOld && Object.keys(userOld).length > 1;
+      if (!hasRelevantOldData) {
+        console.log('Skipping Users UPDATE - insufficient old data:', userOld);
+        return;
       }
 
-      // PnL changes (significant gains/losses)
+      // Deposit detection
+      const newAmt = Number(userNew.amount_deposited || 0);
+      const oldAmt = Number(userOld.amount_deposited || 0);
+      if (newAmt > oldAmt && oldAmt >= 0) {
+        const depositAmount = newAmt - oldAmt;
+        if (depositAmount > 0.01) { // Minimum threshold to avoid dust
+          const msg = `💰 <b>Deposit detected</b>\n` +
+            `User: @${escapeHtml(username)} (<code>${fmt(id)}</code>)\n` +
+            `Amount: <b>+${fmt(depositAmount)}</b>\n` +
+            `New total: <b>${fmt(newAmt)}</b>`;
+          console.log('Users UPDATE (deposit):', { before: oldAmt, after: newAmt, deposit: depositAmount });
+          await sendTelegramMessage(msg);
+        }
+      }
+
+      // PnL changes
       const newPnL = Number(userNew.total_pnl || 0);
-      const oldPnL = Number(userOld.total_pnl ?? 0);
+      const oldPnL = Number(userOld.total_pnl || 0);
       const pnlChange = newPnL - oldPnL;
-      if (Math.abs(pnlChange) >= 100) { // Alert for PnL changes >= $100
+      if (Math.abs(pnlChange) >= 100) {
         const emoji = pnlChange > 0 ? '📈' : '📉';
         const msg = `${emoji} <b>Significant PnL change</b>\n` +
           `User: @${escapeHtml(username)} (<code>${fmt(id)}</code>)\n` +
@@ -217,60 +283,59 @@ pollSQSMessages();
         await sendTelegramMessage(msg);
       }
 
-      // Volume milestones
+      // Volume milestones with deduplication
       const newVolume = Number(userNew.total_volume || 0);
-      const oldVolume = Number(userOld.total_volume ?? 0);
+      const oldVolume = Number(userOld.total_volume || 0);
       const volumeMilestones = [1000, 5000, 10000, 25000, 50000, 100000];
-      for (const milestone of volumeMilestones) {
-        if (oldVolume < milestone && newVolume >= milestone) {
-          const msg = `🎯 <b>Volume milestone reached!</b>\n` +
-            `User: @${escapeHtml(username)} (<code>${fmt(id)}</code>)\n` +
-            `Milestone: <b>$${milestone.toLocaleString()}</b>\n` +
-            `Current volume: <b>$${fmt(newVolume)}</b>`;
-          console.log('Users UPDATE (volume milestone):', { user: id, milestone, volume: newVolume });
-          await sendTelegramMessage(msg);
-          break; // Only alert for the first milestone reached
-        }
+      
+      const volumeMsg = checkAndNotifyMilestone(id, 'volume', oldVolume, newVolume, volumeMilestones, (milestone, current) => {
+        return `🎯 <b>Volume milestone reached!</b>\n` +
+          `User: @${escapeHtml(username)} (<code>${fmt(id)}</code>)\n` +
+          `Milestone: <b>$${milestone.toLocaleString()}</b>\n` +
+          `Current volume: <b>$${fmt(current)}</b>`;
+      });
+      
+      if (volumeMsg) {
+        console.log('Users UPDATE (volume milestone):', { user: id, volume: newVolume });
+        await sendTelegramMessage(volumeMsg);
       }
 
-      // Trading activity milestones
+      // Trading milestones with deduplication
       const newTxns = Number(userNew.txns_executed || 0);
-      const oldTxns = Number(userOld.txns_executed ?? 0);
+      const oldTxns = Number(userOld.txns_executed || 0);
       const txnMilestones = [10, 50, 100, 500, 1000];
-      for (const milestone of txnMilestones) {
-        if (oldTxns < milestone && newTxns >= milestone) {
-          const msg = `🏆 <b>Trading milestone reached!</b>\n` +
-            `User: @${escapeHtml(username)} (<code>${fmt(id)}</code>)\n` +
-            `Transactions: <b>${fmt(newTxns)}</b>\n` +
-            `Markets traded: <b>${fmt(userNew.markets_traded)}</b>`;
-          console.log('Users UPDATE (txn milestone):', { user: id, milestone, txns: newTxns });
+      
+      const txnMsg = checkAndNotifyMilestone(id, 'txns', oldTxns, newTxns, txnMilestones, (milestone, current) => {
+        return `🏆 <b>Trading milestone reached!</b>\n` +
+          `User: @${escapeHtml(username)} (<code>${fmt(id)}</code>)\n` +
+          `Transactions: <b>${fmt(current)}</b>\n` +
+          `Markets traded: <b>${fmt(userNew.markets_traded)}</b>`;
+      });
+      
+      if (txnMsg) {
+        console.log('Users UPDATE (txn milestone):', { user: id, txns: newTxns });
+        await sendTelegramMessage(txnMsg);
+      }
+
+      // Copytrading status changes
+      if ('is_copytrading_enabled' in userOld) {
+        const newCopytrading = Boolean(userNew.is_copytrading_enabled);
+        const oldCopytrading = Boolean(userOld.is_copytrading_enabled);
+        if (newCopytrading !== oldCopytrading) {
+          const status = newCopytrading ? 'enabled' : 'disabled';
+          const emoji = newCopytrading ? '🔄' : '⏸️';
+          const msg = `${emoji} <b>Copytrading ${status}</b>\n` +
+            `User: @${escapeHtml(username)} (<code>${fmt(id)}</code>)`;
+          console.log('Users UPDATE (copytrading):', { user: id, status });
           await sendTelegramMessage(msg);
-          break;
         }
       }
 
-      // Copytrading status changes - only notify if we have a previous value
-      const hasOldCopyField = Object.prototype.hasOwnProperty.call(userOld, 'is_copytrading_enabled');
-      const newCopytrading = Boolean(userNew.is_copytrading_enabled);
-      const oldCopytrading = Boolean(userOld.is_copytrading_enabled);
-      if (!hasOldCopyField) {
-        // Sometimes realtime payload.old contains only the primary key or limited columns.
-        // In that case we skip notifying to avoid spurious messages.
-        console.log('Users UPDATE (copytrading): skipping notification because payload.old lacks is_copytrading_enabled', { user: id });
-      } else if (newCopytrading !== oldCopytrading) {
-        const status = newCopytrading ? 'enabled' : 'disabled';
-        const emoji = newCopytrading ? '🔄' : '⏸️';
-        const msg = `${emoji} <b>Copytrading ${status}</b>\n` +
-          `User: @${escapeHtml(username)} (<code>${fmt(id)}</code>)`;
-        console.log('Users UPDATE (copytrading):', { user: id, status });
-        await sendTelegramMessage(msg);
-      }
-
-      // Fee accumulation alerts (for high-volume traders)
+      // Fee accumulation alerts
       const newFees = Number(userNew.fees_total || 0);
-      const oldFees = Number(userOld.fees_total ?? 0);
+      const oldFees = Number(userOld.fees_total || 0);
       const feeIncrease = newFees - oldFees;
-      if (feeIncrease >= 50) { // Alert for fee increases >= $50
+      if (feeIncrease >= 50) {
         const msg = `💸 <b>High fees incurred</b>\n` +
           `User: @${escapeHtml(username)} (<code>${fmt(id)}</code>)\n` +
           `Session fees: <b>$${fmt(feeIncrease)}</b>\n` +
@@ -279,68 +344,64 @@ pollSQSMessages();
         await sendTelegramMessage(msg);
       }
     })
-    .subscribe((status) => {
-      if (status === 'SUBSCRIBED') console.log('Subscribed to Users UPDATE');
-    });
 
-  // Auto_Trade UPDATE (status changes)
-  const autoTradeUpdate = supabase.channel('auto-trade-update')
+    // Auto_Trade events
     .on('postgres_changes', {
       event: 'UPDATE',
       schema: 'public',
       table: 'Auto_Trade'
     }, async (payload) => {
-      try {
-        console.log('Auto_Trade UPDATE payload.old:', payload.old);
-        console.log('Auto_Trade UPDATE payload.new:', payload.new);
-      } catch (e) {
-        console.log('Auto_Trade UPDATE payload (raw):', payload);
+      const eventId = generateEventId('Auto_Trade', 'UPDATE', payload);
+      if (isDuplicateEvent(eventId)) {
+        console.log('Skipping duplicate Auto_Trade UPDATE event');
+        return;
       }
 
       const status = String(payload.new?.status || '').toLowerCase();
       const prevStatus = String(payload.old?.status || '').toLowerCase();
       const trade = payload.new;
 
-      if (status === 'executed' && prevStatus !== 'executed') {
-        const msg = `✅ <b>Trade executed successfully</b>\n` +
-          `User: <code>${escapeHtml(fmt(trade.user_id))}</code>\n` +
-          `Market: <b>${escapeHtml(trade.market_title)}</b>\n` +
-          `Side: <b>${escapeHtml(trade.side)}</b>\n` +
-          `Size: <b>${fmt(trade.copied_size || trade.original_size)}</b> @ <b>${fmt(trade.copied_price || trade.original_price)}</b>\n` +
-          `Trade hash: <code>${escapeHtml(trade.copied_trade_hash)}</code>`;
-        console.log('Auto_Trade UPDATE (executed):', trade);
-        await sendTelegramMessage(msg);
-      } else if (status === 'failed' && prevStatus !== 'failed') {
-        const msg = `❌ <b>Trade failed</b>\n` +
-          `User: <code>${escapeHtml(fmt(trade.user_id))}</code>\n` +
-          `Market: <b>${escapeHtml(trade.market_title)}</b>\n` +
-          `Side: <b>${escapeHtml(trade.side)}</b>\n` +
-          `Error: <code>${escapeHtml(trade.error_message || 'Unknown error')}</code>\n` +
-          `Original hash: <code>${escapeHtml(trade.original_trade_hash)}</code>`;
-        console.log('Auto_Trade UPDATE (failed):', trade);
-        await sendTelegramMessage(msg);
-      } else if (status === 'skipped' && prevStatus !== 'skipped') {
-        const msg = `⏭️ <b>Trade skipped</b>\n` +
-          `User: <code>${escapeHtml(fmt(trade.user_id))}</code>\n` +
-          `Market: <b>${escapeHtml(trade.market_title)}</b>\n` +
-          `Reason: <code>${escapeHtml(trade.error_message || 'Trade conditions not met')}</code>`;
-        console.log('Auto_Trade UPDATE (skipped):', trade);
-        await sendTelegramMessage(msg);
-      } else {
-        console.log(`Auto_Trade UPDATE (no relevant transition): status=${status} prev=${prevStatus}`);
+      if (status !== prevStatus) {
+        if (status === 'executed') {
+          const msg = `✅ <b>Trade executed successfully</b>\n` +
+            `User: <code>${escapeHtml(fmt(trade.user_id))}</code>\n` +
+            `Market: <b>${escapeHtml(trade.market_title)}</b>\n` +
+            `Side: <b>${escapeHtml(trade.side)}</b>\n` +
+            `Size: <b>${fmt(trade.copied_size || trade.original_size)}</b> @ <b>${fmt(trade.copied_price || trade.original_price)}</b>\n` +
+            `Trade hash: <code>${escapeHtml(trade.copied_trade_hash)}</code>`;
+          console.log('Auto_Trade UPDATE (executed):', trade);
+          await sendTelegramMessage(msg);
+        } else if (status === 'failed') {
+          const msg = `❌ <b>Trade failed</b>\n` +
+            `User: <code>${escapeHtml(fmt(trade.user_id))}</code>\n` +
+            `Market: <b>${escapeHtml(trade.market_title)}</b>\n` +
+            `Side: <b>${escapeHtml(trade.side)}</b>\n` +
+            `Error: <code>${escapeHtml(trade.error_message || 'Unknown error')}</code>\n` +
+            `Original hash: <code>${escapeHtml(trade.original_trade_hash)}</code>`;
+          console.log('Auto_Trade UPDATE (failed):', trade);
+          await sendTelegramMessage(msg);
+        } else if (status === 'skipped') {
+          const msg = `⏭️ <b>Trade skipped</b>\n` +
+            `User: <code>${escapeHtml(fmt(trade.user_id))}</code>\n` +
+            `Market: <b>${escapeHtml(trade.market_title)}</b>\n` +
+            `Reason: <code>${escapeHtml(trade.error_message || 'Trade conditions not met')}</code>`;
+          console.log('Auto_Trade UPDATE (skipped):', trade);
+          await sendTelegramMessage(msg);
+        }
       }
     })
-    .subscribe((status) => {
-      if (status === 'SUBSCRIBED') console.log('Subscribed to Auto_Trade UPDATE');
-    });
 
-  // Auto_Trade INSERT (new trade detected)
-  const autoTradeInsert = supabase.channel('auto-trade-insert')
     .on('postgres_changes', {
       event: 'INSERT',
       schema: 'public',
       table: 'Auto_Trade'
     }, async (payload) => {
+      const eventId = generateEventId('Auto_Trade', 'INSERT', payload);
+      if (isDuplicateEvent(eventId)) {
+        console.log('Skipping duplicate Auto_Trade INSERT event');
+        return;
+      }
+
       const t = payload.new;
       const msg = `🆕 <b>New trade detected</b>\n` +
         `User: <code>${escapeHtml(fmt(t.user_id))}</code>\n` +
@@ -355,17 +416,19 @@ pollSQSMessages();
       console.log('Auto_Trade INSERT:', t);
       await sendTelegramMessage(msg);
     })
-    .subscribe((status) => {
-      if (status === 'SUBSCRIBED') console.log('Subscribed to Auto_Trade INSERT');
-    });
 
-  // Copy_Wallets INSERT (new wallet added for copying)
-  const copyWalletsInsert = supabase.channel('copy-wallets-insert')
+    // Copy_Wallets events
     .on('postgres_changes', {
       event: 'INSERT',
       schema: 'public',
       table: 'Copy_Wallets'
     }, async (payload) => {
+      const eventId = generateEventId('Copy_Wallets', 'INSERT', payload);
+      if (isDuplicateEvent(eventId)) {
+        console.log('Skipping duplicate Copy_Wallets INSERT event');
+        return;
+      }
+
       const wallet = payload.new;
       const msg = `👁️ <b>New wallet added for copying</b>\n` +
         `User: <code>${escapeHtml(fmt(wallet.user_id))}</code>\n` +
@@ -375,19 +438,25 @@ pollSQSMessages();
       console.log('Copy_Wallets INSERT:', wallet);
       await sendTelegramMessage(msg);
     })
-    .subscribe((status) => {
-      if (status === 'SUBSCRIBED') console.log('Subscribed to Copy_Wallets INSERT');
-    });
 
-  // Copy_Wallets UPDATE (wallet settings changed)
-  const copyWalletsUpdate = supabase.channel('copy-wallets-update')
     .on('postgres_changes', {
       event: 'UPDATE',
       schema: 'public',
       table: 'Copy_Wallets'
     }, async (payload) => {
+      const eventId = generateEventId('Copy_Wallets', 'UPDATE', payload);
+      if (isDuplicateEvent(eventId)) {
+        console.log('Skipping duplicate Copy_Wallets UPDATE event');
+        return;
+      }
+
       const walletNew = payload.new;
       const walletOld = payload.old || {};
+      
+      if (Object.keys(walletOld).length <= 1) {
+        console.log('Skipping Copy_Wallets UPDATE - insufficient old data');
+        return;
+      }
       
       const newEnabled = walletNew.is_enabled;
       const oldEnabled = walletOld.is_enabled;
@@ -403,7 +472,7 @@ pollSQSMessages();
           `Copy ratio: <b>${fmt(walletNew.percent_ratio * 100)}%</b>`;
         console.log('Copy_Wallets UPDATE (enabled/disabled):', walletNew);
         await sendTelegramMessage(msg);
-      } else if (Math.abs(newRatio - oldRatio) > 0.001) { // Ratio changed significantly
+      } else if (Math.abs(newRatio - oldRatio) > 0.001) {
         const msg = `⚙️ <b>Copy ratio updated</b>\n` +
           `User: <code>${escapeHtml(fmt(walletNew.user_id))}</code>\n` +
           `Wallet: <code>${escapeHtml(walletNew.wallet_address)}</code>\n` +
@@ -412,17 +481,19 @@ pollSQSMessages();
         await sendTelegramMessage(msg);
       }
     })
-    .subscribe((status) => {
-      if (status === 'SUBSCRIBED') console.log('Subscribed to Copy_Wallets UPDATE');
-    });
 
-  // Monthly_Active_Users INSERT (monthly activity tracking)
-  const monthlyActiveUsersInsert = supabase.channel('monthly-active-users-insert')
+    // Monthly_Active_Users INSERT
     .on('postgres_changes', {
       event: 'INSERT',
       schema: 'public',
       table: 'Monthly_Active_Users'
     }, async (payload) => {
+      const eventId = generateEventId('Monthly_Active_Users', 'INSERT', payload);
+      if (isDuplicateEvent(eventId)) {
+        console.log('Skipping duplicate Monthly_Active_Users INSERT event');
+        return;
+      }
+
       const record = payload.new;
       const msg = `📊 <b>Monthly active user recorded</b>\n` +
         `User: <code>${escapeHtml(fmt(record.user_id))}</code>\n` +
@@ -431,9 +502,19 @@ pollSQSMessages();
       console.log('Monthly_Active_Users INSERT:', record);
       await sendTelegramMessage(msg);
     })
+
     .subscribe((status) => {
-      if (status === 'SUBSCRIBED') console.log('Subscribed to Monthly_Active_Users INSERT');
+      console.log('Database events subscription status:', status);
+      if (status === 'SUBSCRIBED') {
+        console.log('Successfully subscribed to all database events');
+      } else if (status === 'CHANNEL_ERROR') {
+        console.error('Channel error - attempting to reconnect in 5 seconds...');
+        setTimeout(() => {
+          console.log('Attempting to reconnect...');
+          // Could implement reconnection logic here
+        }, 5000);
+      }
     });
 
-  console.log('Enhanced bot is running and listening for events...');
+  console.log('Enhanced bot with deduplication is running and listening for events...');
 })();
