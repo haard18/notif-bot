@@ -2,6 +2,7 @@
 const { createClient } = require('@supabase/supabase-js');
 const TelegramBot = require('node-telegram-bot-api');
 const AWS = require('aws-sdk');
+global.WebSocket = require('ws'); // Essential for Supabase real-time connections
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
 const SUPABASE_KEY = process.env.SUPABASE_KEY;
